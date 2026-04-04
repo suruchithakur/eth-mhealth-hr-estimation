@@ -1,0 +1,615 @@
+"""
+Heart Rate Estimation from PPG signals
+ETH Zurich - Mobile Health and Activity Monitoring, Spring 2026
+
+Algorithm:
+  1. Bandpass filter PPG (35-200 bpm, wider than HR range for rolloff margin)
+  2. Harmonic-aware spectral peak selection — scores each candidate frequency
+     by how well it explains the full spectrum including harmonics above HR_MAX
+  3. Peak-based HR as a secondary estimate with IBI confidence scoring
+  4. Fusion: spectrum-first, with one subharmonic correction case
+  5. Conservative continuity correction for harmonic jumps
+  6. Confidence-weighted smoothing (±1 window)
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from scipy.signal import butter, filtfilt, find_peaks
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+DATA_PATH = '/Users/suruchithakur/Desktop/UZH/Sem-1/Mobile Health and Activity Monitoring/Exercise-2/ppg-hr-exercise-2/mhealth26_ex2.npy'
+
+FS      = 128
+WIN_SEC = 30
+WIN_N   = FS * WIN_SEC
+
+HR_MIN_BPM = 40
+HR_MAX_BPM = 180
+HR_MIN_HZ  = HR_MIN_BPM / 60
+HR_MAX_HZ  = HR_MAX_BPM / 60
+
+# Slightly wider than HR range → rolloff margin at 40 & 180 bpm edges
+FILTER_LOW_HZ  = 35  / 60   # ~0.583 Hz
+FILTER_HIGH_HZ = 200 / 60   # ~3.333 Hz
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL PROCESSING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def bandpass_filter(sig):
+    nyq  = FS / 2
+    b, a = butter(4, [FILTER_LOW_HZ / nyq, FILTER_HIGH_HZ / nyq], btype='band')
+    return filtfilt(b, a, sig)
+
+
+def acc_magnitude(imu):
+    x, y, z = imu[0].astype(float), imu[1].astype(float), imu[2].astype(float)
+    return np.sqrt(x**2 + y**2 + z**2)
+
+
+def power_spectrum(window, pad_factor=4):
+    n     = len(window)
+    n_fft = n * pad_factor
+    win   = window * np.hanning(n)
+    fft   = np.fft.rfft(win, n=n_fft)
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / FS)
+    power = np.abs(fft) ** 2
+    mask  = (freqs >= HR_MIN_HZ) & (freqs <= HR_MAX_HZ)
+    return freqs[mask], power[mask]
+
+
+def signal_snr(ppg_filt):
+    noise      = ppg_filt - np.convolve(ppg_filt, np.ones(5) / 5, mode='same')
+    signal_var = np.var(ppg_filt)
+    noise_var  = np.var(noise)
+    if noise_var < 1e-10:
+        return 100.0
+    return signal_var / noise_var
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HARMONIC-AWARE SPECTRAL PEAK SELECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def best_fundamental(freqs, power):
+    """
+    Score each candidate f0 by how well it explains the full spectrum.
+
+    Uses a wide harmonic lookup grid (up to 3× HR_MAX_HZ) so that high-HR
+    fundamentals (~100 bpm) get credit for their 2nd harmonic at ~200 bpm.
+    Without this, a 50 bpm subharmonic scores better than a true 100 bpm
+    fundamental because the 100 bpm candidate can't see its harmonics.
+
+    Also penalises candidates whose sub-frequency (f0/2) has strong power,
+    since that indicates we're sitting on a harmonic, not a fundamental.
+    """
+    f_fine = np.linspace(HR_MIN_HZ, HR_MAX_HZ, 2000)
+    p_fine = np.interp(f_fine, freqs, power)
+
+    f_wide = np.linspace(HR_MIN_HZ, HR_MAX_HZ * 3, 6000)
+    p_wide = np.interp(f_wide, freqs, power, right=0.0)
+
+    scores = np.zeros_like(f_fine)
+    for i, f0 in enumerate(f_fine):
+        s = p_fine[i]
+        s += 0.5  * float(np.interp(f0 * 2, f_wide, p_wide))
+        s += 0.25 * float(np.interp(f0 * 3, f_wide, p_wide))
+
+        f_half = f0 / 2.0
+        if f_half >= HR_MIN_HZ:
+            p_half = float(np.interp(f_half, f_fine, p_fine))
+            if p_half > p_fine[i] * 0.6:
+                s *= 0.3
+
+        scores[i] = s
+
+    best_idx = np.argmax(scores)
+    return f_fine[best_idx], scores[best_idx]
+
+
+def spectral_confidence(freqs, power):
+    """Peak-to-mean power ratio — higher means cleaner, more tonal signal."""
+    return power.max() / (power.mean() + 1e-10)
+
+
+def motion_level(acc_win):
+    return np.std(acc_win)
+
+
+def subtract_motion(ppg_pwr, acc_pwr):
+    """Adaptively subtract motion spectrum from PPG spectrum."""
+    ppg_norm = ppg_pwr / (ppg_pwr.max() + 1e-10)
+    acc_norm = acc_pwr / (acc_pwr.max() + 1e-10)
+    overlap  = np.dot(ppg_norm, acc_norm) / (np.linalg.norm(acc_norm) + 1e-10)
+    weight   = np.clip(overlap * 1.5, 0.0, 0.9)
+    cleaned  = np.clip(ppg_norm - weight * acc_norm, 0, None)
+    if cleaned.max() < 1e-6:
+        return ppg_norm
+    return cleaned
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PEAK-BASED HR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def hr_from_peaks(ppg_win):
+    """
+    Estimate HR from inter-beat intervals.
+    Returns (hr_bpm, confidence) where confidence reflects IBI regularity.
+    """
+    min_dist = int(FS / HR_MAX_HZ)
+    peaks, _ = find_peaks(
+        ppg_win,
+        distance=min_dist,
+        prominence=np.std(ppg_win) * 0.4
+    )
+    if len(peaks) < 2:
+        return None, 0.0
+
+    ibi   = np.diff(peaks) / FS
+    valid = ibi[(ibi >= 1.0 / HR_MAX_HZ) & (ibi <= 1.0 / HR_MIN_HZ)]
+    if len(valid) < 2:
+        return None, 0.0
+
+    hr     = 60.0 / np.median(valid)
+    ibi_cv = np.std(valid) / (np.mean(valid) + 1e-10)
+    conf   = 1.0 / (1.0 + ibi_cv)
+    return float(hr), float(conf)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PER-WINDOW ESTIMATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def estimate_window(ppg_win, acc_win):
+    """
+    Estimate HR for a single 30-second window.
+    Returns (hr_bpm, spectral_confidence).
+    """
+    ppg_filt = bandpass_filter(ppg_win)
+
+    freqs, ppg_pwr = power_spectrum(ppg_filt)
+    _, acc_pwr     = power_spectrum(acc_win)
+    motion         = motion_level(acc_win)
+
+    # Adaptive motion subtraction for high-motion windows.
+    # Exception: if the raw spectral peak is already above 80 bpm, the
+    # PPG signal is tracking a high HR correctly — don't subtract motion
+    # and risk destroying a valid high-HR estimate (phase 14 win 32: raw=147.5).
+    raw_peak_bpm = freqs[np.argmax(ppg_pwr)] * 60.0
+
+    if motion > 80 and raw_peak_bpm <= 80:
+        pwr_for_spec = subtract_motion(ppg_pwr, acc_pwr)
+    else:
+        pwr_for_spec = ppg_pwr / (ppg_pwr.max() + 1e-10)
+
+    # Spectral HR estimate
+    hr_spec_hz, _ = best_fundamental(freqs, pwr_for_spec)
+    hr_spec        = hr_spec_hz * 60.0
+
+    # Peak-based HR estimate
+    hr_peak, peak_conf = hr_from_peaks(ppg_filt)
+    snr       = signal_snr(ppg_filt)
+    spec_conf = spectral_confidence(freqs, pwr_for_spec)
+
+    # Detect spectrum failure: raw peak stuck at filter floor (40 bpm)
+    raw_peak_hz     = freqs[np.argmax(pwr_for_spec)]
+    spectrum_failed = (raw_peak_hz * 60.0) < (HR_MIN_BPM + 2.0)
+
+    # ── Fusion: spectrum-first ────────────────────────────────────────────────
+    if spectrum_failed:
+        # Spectrum is at noise floor — peak detector is the only option
+        hr = hr_peak if hr_peak is not None else hr_spec
+
+    elif hr_peak is not None:
+        diff = abs(hr_spec - hr_peak)
+
+        # Subharmonic correction: spec is stuck at half the true HR.
+        # Fires when spectrum is stuck very low (< 58 bpm) and peaks
+        # confidently see double that frequency.
+        # sc raised to 20 to catch phases 31 (sc=9-16) and 14 late windows.
+        # hr_spec < 58 (tighter than 65) prevents firing when spec is
+        # already close to a real HR in the 58-65 bpm range (phases 3, 6).
+        is_subharmonic = (
+            abs(hr_peak - hr_spec * 2) < 6
+            and peak_conf > 0.62
+            and spec_conf < 10
+            and hr_spec < 58
+            and 65 <= hr_peak <= 155
+        )
+
+        if is_subharmonic:
+            hr = hr_peak
+        elif motion < 100 and snr > 5:
+            if diff < 10:
+                # Both roughly agree — blend, spectrum weighted more
+                hr = 0.6 * hr_spec + 0.4 * hr_peak
+            elif peak_conf > 0.75:
+                # Very regular IBI — trust peak detector
+                hr = hr_peak
+            else:
+                hr = hr_spec
+        else:
+            # High motion or poor SNR — spectrum more robust
+            hr = hr_spec
+
+    else:
+        hr = hr_spec
+
+    return float(np.clip(hr, HR_MIN_BPM, HR_MAX_BPM)), spec_conf
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTINUITY CORRECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def continuity_correction(hr_vals):
+    """
+    Correct harmonic jumps (2× or 0.5×) between adjacent windows.
+    Conservative: requires large jump, clear harmonic alternative, AND
+    the next window must also disagree with the current estimate.
+    """
+    hr  = np.array(hr_vals, dtype=float)
+    out = hr.copy()
+    n   = len(hr)
+
+    for i in range(1, n):
+        prev = out[i - 1]
+        curr = hr[i]
+        jump = abs(curr - prev)
+
+        if jump < 25:
+            continue
+
+        half   = curr / 2.0
+        double = curr * 2.0
+
+        d_curr   = jump
+        d_half   = abs(half   - prev) if HR_MIN_BPM <= half   <= HR_MAX_BPM else 1e9
+        d_double = abs(double - prev) if HR_MIN_BPM <= double <= HR_MAX_BPM else 1e9
+
+        if d_half < d_curr * 0.4 and d_half < d_double:
+            # Don't halve if current looks like a valid subharmonic fix:
+            # current is in plausible HR range and half would land in the
+            # known-subharmonic zone (40-62 bpm). This prevents undoing
+            # the subharmonic correction from estimate_window.
+            if 65 <= curr <= 155 and half < 62:
+                continue
+            candidate = half
+        elif d_double < d_curr * 0.4 and d_double < d_half:
+            candidate = double
+        else:
+            continue
+
+        # Only correct if next window also disagrees with curr
+        if i < n - 1:
+            next_hr = hr[i + 1]
+            if abs(next_hr - curr) < abs(next_hr - prev):
+                continue  # next window agrees with curr → real HR change
+
+        out[i] = np.clip(candidate, HR_MIN_BPM, HR_MAX_BPM)
+
+    return out
+
+
+def smooth_hr_weighted(hr_vals, conf_vals, half_window=1):
+    """
+    Confidence-weighted smoothing over ±1 window (3 points total).
+    Bad-confidence windows don't corrupt their neighbors.
+    """
+    hr   = np.array(hr_vals,   dtype=float)
+    conf = np.array(conf_vals, dtype=float)
+    norm = conf / (conf.max() + 1e-10)
+
+    smoothed = hr.copy()
+    for i in range(len(hr)):
+        lo = max(0, i - half_window)
+        hi = min(len(hr), i + half_window + 1)
+        w  = norm[lo:hi]
+        smoothed[i] = np.average(hr[lo:hi], weights=w + 1e-6)
+
+    return smoothed
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE PIPELINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def estimate_hr(ppg, imu):
+    n_win   = len(ppg) // WIN_N
+    acc_mag = acc_magnitude(imu)
+
+    hr_vals   = []
+    conf_vals = []
+
+    for w in range(n_win):
+        s, e    = w * WIN_N, (w + 1) * WIN_N
+        ppg_win = ppg[s:e].astype(float)
+        acc_win = acc_mag[s:e]
+        hr, conf = estimate_window(ppg_win, acc_win)
+        hr_vals.append(hr)
+        conf_vals.append(conf)
+
+    hr_corrected = continuity_correction(hr_vals)
+    hr_smoothed  = smooth_hr_weighted(hr_corrected.tolist(), conf_vals, half_window=1)
+
+    return list(hr_smoothed), conf_vals
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVALUATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def competition_score(pred, gt):
+    errs  = np.abs(np.array(pred) - np.array(gt))
+    mae   = np.mean(errs)
+    medae = np.median(errs)
+    return (mae + medae) / 2.0, mae, medae
+
+
+def evaluate(data):
+    ppg_all = data['ppg']
+    imu_all = data['imu']
+    gt_all  = data.get('hr', None)
+
+    if gt_all is None:
+        print("No ground truth key 'hr' found. Keys:", list(data.keys()))
+        return None
+
+    print("\n" + "="*76)
+    print(f"{'Phase':>6}  {'#Win':>5}  {'MAE':>8}  {'MedAE':>8}  {'Score':>8}  {'WorstWin':>12}")
+    print("="*76)
+
+    all_pred      = []
+    all_gt        = []
+    phase_results = []
+
+    for phase_idx in range(len(ppg_all)):
+        gt_phase = gt_all[phase_idx]
+        if gt_phase is None or len(gt_phase) == 0:
+            continue
+
+        pred_list, conf_list = estimate_hr(ppg_all[phase_idx], imu_all[phase_idx])
+        pred = np.array(pred_list)
+        gt   = np.array(gt_phase)
+        n    = min(len(pred), len(gt))
+        pred, gt = pred[:n], gt[:n]
+
+        errs          = np.abs(pred - gt)
+        s, mae, medae = competition_score(pred, gt)
+        worst_win     = int(np.argmax(errs))
+
+        print(f"{phase_idx:>6}  {n:>5}  {mae:>8.2f}  {medae:>8.2f}  {s:>8.2f}"
+              f"  win {worst_win:>3} ({errs[worst_win]:.1f} bpm)")
+
+        all_pred.extend(pred.tolist())
+        all_gt.extend(gt.tolist())
+        phase_results.append({
+            'phase': phase_idx, 'n_windows': n,
+            'mae': mae, 'medae': medae, 'score': s,
+            'worst_window': worst_win, 'worst_error': errs[worst_win],
+            'pred': pred, 'gt': gt, 'conf': conf_list[:n], 'errors': errs,
+        })
+
+    all_pred = np.array(all_pred)
+    all_gt   = np.array(all_gt)
+    final_s, final_mae, final_medae = competition_score(all_pred, all_gt)
+
+    print("="*76)
+    print(f"\n{'OVERALL':>6}  {len(all_pred):>5}  {final_mae:>8.2f}  "
+          f"{final_medae:>8.2f}  {final_s:>8.2f}")
+    print(f"\n  ✦  FINAL SCORE  →  {final_s:.4f}   (MAE {final_mae:.2f} | MedAE {final_medae:.2f})")
+    print("="*76 + "\n")
+
+    return phase_results, all_pred, all_gt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLOTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_phase_summary(phase_results):
+    phases = [r['phase'] for r in phase_results]
+    scores = [r['score'] for r in phase_results]
+    maes   = [r['mae']   for r in phase_results]
+    medaes = [r['medae'] for r in phase_results]
+    colors = ['#d62728' if s > 10 else '#ff7f0e' if s > 5 else '#2ca02c' for s in scores]
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+    fig.suptitle('Per-Phase Evaluation', fontsize=14, fontweight='bold')
+
+    axes[0].bar(phases, scores, color=colors, edgecolor='white', linewidth=0.5)
+    axes[0].axhline(5,  color='green', linestyle='--', linewidth=1, label='Full points (≤5)')
+    axes[0].axhline(15, color='red',   linestyle='--', linewidth=1, label='Zero points (≥15)')
+    axes[0].set_ylabel('Score')
+    axes[0].set_title('Competition Score per Phase')
+    axes[0].legend(fontsize=9)
+    axes[0].set_ylim(0, max(max(scores) * 1.15, 17))
+
+    x = np.arange(len(phases))
+    w = 0.4
+    axes[1].bar(x - w/2, maes,   width=w, label='MAE',   color='#1f77b4', alpha=0.85)
+    axes[1].bar(x + w/2, medaes, width=w, label='MedAE', color='#aec7e8', alpha=0.85)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(phases)
+    axes[1].set_xlabel('Phase Index')
+    axes[1].set_ylabel('BPM Error')
+    axes[1].set_title('MAE and MedAE per Phase')
+    axes[1].legend(fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig('phase_summary.png', dpi=150, bbox_inches='tight')
+    print("Saved: phase_summary.png")
+
+
+def plot_worst_phases(phase_results, top_n=6):
+    sorted_phases = sorted(phase_results, key=lambda r: r['score'], reverse=True)[:top_n]
+    fig, axes = plt.subplots(top_n, 1, figsize=(14, 4 * top_n))
+    if top_n == 1:
+        axes = [axes]
+    fig.suptitle(f'Top {top_n} Hardest Phases — Pred vs GT', fontsize=13, fontweight='bold')
+
+    for ax, r in zip(axes, sorted_phases):
+        t = np.arange(len(r['gt'])) * 30
+        ax.plot(t, r['gt'],   label='Ground Truth', color='#2ca02c', linewidth=2)
+        ax.plot(t, r['pred'], label='Predicted',    color='#d62728', linewidth=1.5, alpha=0.85)
+        for i, (ti, err) in enumerate(zip(t, r['errors'])):
+            if err > 10:
+                ax.axvspan(ti, ti + 30, alpha=0.12, color='red')
+        ax.set_title(f"Phase {r['phase']}  |  Score {r['score']:.2f}  |  "
+                     f"MAE {r['mae']:.2f}  |  MedAE {r['medae']:.2f}")
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('HR (bpm)')
+        ax.legend(fontsize=9)
+        ax.set_ylim(HR_MIN_BPM - 5, HR_MAX_BPM + 5)
+        ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('worst_phases.png', dpi=150, bbox_inches='tight')
+    print("Saved: worst_phases.png")
+
+
+def plot_error_distribution(all_pred, all_gt):
+    errs = np.abs(all_pred - all_gt)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.hist(errs, bins=50, color='#1f77b4', edgecolor='white', linewidth=0.4)
+    ax.axvline(np.mean(errs),   color='red',    linestyle='--', linewidth=1.5,
+               label=f'MAE   = {np.mean(errs):.2f}')
+    ax.axvline(np.median(errs), color='orange', linestyle='--', linewidth=1.5,
+               label=f'MedAE = {np.median(errs):.2f}')
+    ax.set_xlabel('Absolute Error (bpm)')
+    ax.set_ylabel('Number of Windows')
+    ax.set_title('Distribution of Per-Window Absolute Errors')
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('error_distribution.png', dpi=150, bbox_inches='tight')
+    print("Saved: error_distribution.png")
+
+
+def plot_per_window_errors(phase_results):
+    all_errs, all_gt, all_conf = [], [], []
+    for r in phase_results:
+        all_errs.extend(r['errors'].tolist())
+        all_gt.extend(r['gt'].tolist())
+        all_conf.extend(r['conf'])
+
+    all_errs      = np.array(all_errs)
+    all_gt        = np.array(all_gt)
+    all_conf_norm = np.array(all_conf) / (max(all_conf) + 1e-10)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    sc = ax.scatter(all_gt, all_errs, c=all_conf_norm, cmap='RdYlGn',
+                    alpha=0.55, s=18, edgecolors='none')
+    plt.colorbar(sc, ax=ax, label='Spectral Confidence (normalised)')
+    ax.axhline(10, color='red',     linestyle='--', linewidth=1, label='10 bpm error')
+    ax.axhline(20, color='darkred', linestyle='--', linewidth=1, label='20 bpm error')
+    ax.set_xlabel('Ground Truth HR (bpm)')
+    ax.set_ylabel('Absolute Error (bpm)')
+    ax.set_title('Per-Window Error vs True HR  (colour = spectral confidence)')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('error_vs_hr.png', dpi=150, bbox_inches='tight')
+    print("Saved: error_vs_hr.png")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEBUG
+# ─────────────────────────────────────────────────────────────────────────────
+
+def debug_bad_phase(data, phase_idx, n_windows=8):
+    ppg     = data['ppg'][phase_idx]
+    imu     = data['imu'][phase_idx]
+    gt      = data['hr'][phase_idx]
+    acc_mag = acc_magnitude(imu)
+
+    print(f"\n{'='*86}")
+    print(f"DEBUG  Phase {phase_idx}  —  first {n_windows} windows")
+    print(f"{'='*86}")
+    print(f"  {'win':>3}  {'GT':>6}  {'raw_peak':>9}  {'corrected':>10}  "
+          f"{'peak_hr':>8}  {'motion':>7}  {'sc':>6}  {'pc':>5}")
+    print(f"  {'-'*3}  {'-'*6}  {'-'*9}  {'-'*10}  {'-'*8}  {'-'*7}  {'-'*6}  {'-'*5}")
+
+    for w in range(min(n_windows, len(gt))):
+        s, e     = w * WIN_N, (w + 1) * WIN_N
+        ppg_win  = ppg[s:e].astype(float)
+        acc_win  = acc_mag[s:e]
+        ppg_filt = bandpass_filter(ppg_win)
+
+        freqs, pwr  = power_spectrum(ppg_filt)
+        pwr_norm    = pwr / (pwr.max() + 1e-10)
+        raw_peak_hz = freqs[np.argmax(pwr)]
+        best_hz, _  = best_fundamental(freqs, pwr_norm)
+        hr_peak, pc = hr_from_peaks(ppg_filt)
+        motion      = motion_level(acc_win)
+        sc          = spectral_confidence(freqs, pwr_norm)
+
+        peak_str = f"{hr_peak:>6.1f}" if hr_peak is not None else "  None"
+        print(f"  {w:>3}  {gt[w]:>6.1f}  {raw_peak_hz*60:>9.1f}  "
+              f"{best_hz*60:>10.1f}  {peak_str:>8}  "
+              f"{motion:>7.1f}  {sc:>6.1f}  {pc:>5.2f}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBMISSION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_submission(data, output_path='submission.csv'):
+    ppg_all = data['ppg']
+    imu_all = data['imu']
+    rows    = []
+    for phase_idx in range(len(ppg_all)):
+        pred_list, _ = estimate_hr(ppg_all[phase_idx], imu_all[phase_idx])
+        for win_idx, hr_val in enumerate(pred_list):
+            rows.append({'Id': f'window{phase_idx}_{win_idx}', 'Predicted': float(hr_val)})
+    df = pd.DataFrame(rows)[['Id', 'Predicted']]
+    df.to_csv(output_path, index=False)
+    print(f"\nSubmission saved → {output_path}  ({len(df)} rows)")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    print(f"Loading data...\n  {DATA_PATH}\n")
+    data = np.load(DATA_PATH, allow_pickle=True).item()
+
+    results = evaluate(data)
+
+    if results is not None:
+        phase_results, all_pred, all_gt = results
+        plot_phase_summary(phase_results)
+        plot_worst_phases(phase_results, top_n=6)
+        plot_error_distribution(all_pred, all_gt)
+        plot_per_window_errors(phase_results)
+
+    for bad_phase in [1, 9, 13, 28, 31, 14]:
+        debug_bad_phase(data, phase_idx=bad_phase, n_windows=8)
+
+    # Trace fusion decisions for phase 14 around the worst window (32)
+    print("\n=== Phase 14 fusion trace (windows 28-35) ===")
+    ppg14   = data['ppg'][14]
+    imu14   = data['imu'][14]
+    gt14    = data['hr'][14]
+    acc_mag = acc_magnitude(imu14)
+    for w in range(28, min(36, len(gt14))):
+        s, e     = w * WIN_N, (w + 1) * WIN_N
+        ppg_win  = ppg14[s:e].astype(float)
+        acc_win  = acc_mag[s:e]
+        ppg_filt = bandpass_filter(ppg_win)
+        freqs, ppg_pwr = power_spectrum(ppg_filt)
+        _, acc_pwr     = power_spectrum(acc_win)
+        motion         = motion_level(acc_win)
+        pwr_for_spec   = subtract_motion(ppg_pwr, acc_pwr) if motion > 80 \
+                         else ppg_pwr / (ppg_pwr.max() + 1e-10)
+        hr_spec_hz, _  = best_fundamental(freqs, pwr_for_spec)
+        hr_spec        = hr_spec_hz * 60.0
+        hr_peak, pc    = hr_from_peaks(ppg_filt)
+        sc             = spectral_confidence(freqs, pwr_for_spec)
+        raw_hz         = freqs[np.argmax(pwr_for_spec)] * 60
+        sub_check      = abs(hr_peak - hr_spec * 2) if hr_peak else 999
+        gt_w           = gt14[w] if w < len(gt14) else '?'
+        print(f"  win {w:>2}: GT={gt_w:>6.1f} motion={motion:>6.1f} "
+              f"raw={raw_hz:>6.1f} spec={hr_spec:>6.1f} "
+              f"peak={hr_peak if hr_peak else 'None':>6}  "
+              f"sc={sc:>5.1f} pc={pc:>4.2f} |p-2s|={sub_check:>5.1f}")
+
+    generate_submission(data, output_path='submission.csv')
